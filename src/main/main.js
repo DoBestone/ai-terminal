@@ -1,11 +1,13 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 
 let mainWindow;
 let ptyProcess = null;
-let sshConnection = null;
-let sshStream = null;
+
+// 多 SSH 会话存储
+const sshSessions = new Map();
 
 // 动态加载node-pty（需要rebuild）
 let pty;
@@ -23,7 +25,8 @@ function createWindow() {
       nodeIntegration: true,
       contextIsolation: false,
     },
-    titleBarStyle: 'hiddenInset',
+    titleBarStyle: 'hidden',
+    trafficLightPosition: { x: 12, y: 12 },
     backgroundColor: '#1a1a2e',
   });
 
@@ -137,44 +140,76 @@ ipcMain.handle('agent-execute', async (event, command) => {
 // SSH连接
 const { Client } = require('ssh2');
 
-ipcMain.on('ssh-connect', (event, config) => {
-  // 关闭之前的连接
-  if (sshConnection) {
-    sshConnection.end();
-    sshConnection = null;
-    sshStream = null;
+// 选择私钥文件
+ipcMain.handle('select-private-key', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择私钥文件',
+    defaultPath: path.join(os.homedir(), '.ssh'),
+    properties: ['openFile'],
+    filters: [
+      { name: '私钥文件', extensions: ['pem', 'key', ''] },
+      { name: '所有文件', extensions: ['*'] }
+    ]
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+  return result.filePaths[0];
+});
+
+ipcMain.on('ssh-connect', (event, { sessionId, config }) => {
+  // 关闭该会话之前的连接
+  if (sshSessions.has(sessionId)) {
+    const session = sshSessions.get(sessionId);
+    if (session.conn) {
+      session.conn.end();
+    }
+    sshSessions.delete(sessionId);
   }
 
   const conn = new Client();
-  sshConnection = conn;
+
+  // 创建会话记录
+  sshSessions.set(sessionId, {
+    conn: conn,
+    stream: null,
+    status: 'connecting',
+    config: config
+  });
 
   conn.on('ready', () => {
-    event.reply('ssh-status', { status: 'connected', message: '连接成功' });
+    const session = sshSessions.get(sessionId);
+    if (session) {
+      session.status = 'connected';
+    }
+    event.reply('ssh-status', { sessionId, status: 'connected', message: '连接成功' });
 
     conn.shell({ term: 'xterm-256color' }, (err, stream) => {
       if (err) {
-        event.reply('ssh-status', { status: 'error', message: err.message });
+        event.reply('ssh-status', { sessionId, status: 'error', message: err.message });
         return;
       }
 
-      sshStream = stream;
+      if (session) {
+        session.stream = stream;
+      }
 
       stream.on('data', (data) => {
-        event.reply('ssh-data', data.toString());
+        event.reply('ssh-data', { sessionId, data: data.toString() });
       });
 
       stream.stderr.on('data', (data) => {
-        event.reply('ssh-data', data.toString());
+        event.reply('ssh-data', { sessionId, data: data.toString() });
       });
 
       stream.on('close', () => {
-        event.reply('ssh-status', { status: 'disconnected', message: '连接已断开' });
-        sshConnection = null;
-        sshStream = null;
+        event.reply('ssh-status', { sessionId, status: 'disconnected', message: '连接已断开' });
+        sshSessions.delete(sessionId);
       });
 
       stream.on('error', (err) => {
-        event.reply('ssh-status', { status: 'error', message: `流错误: ${err.message}` });
+        event.reply('ssh-status', { sessionId, status: 'error', message: `流错误: ${err.message}` });
       });
     });
   });
@@ -185,19 +220,23 @@ ipcMain.on('ssh-connect', (event, config) => {
     if (err.message.includes('Timed out')) {
       errorMsg = '连接超时，请检查网络或服务器地址';
     } else if (err.message.includes('authentication')) {
-      errorMsg = '认证失败，请检查用户名和密码';
+      errorMsg = '认证失败，请检查用户名和密码/私钥';
     } else if (err.message.includes('ECONNREFUSED')) {
       errorMsg = '连接被拒绝，请检查服务器地址和端口';
     } else if (err.message.includes('ECONNRESET')) {
       errorMsg = '连接被重置，服务器可能断开了连接';
     } else if (err.message.includes('EHOSTUNREACH')) {
       errorMsg = '无法访问主机，请检查网络连接';
+    } else if (err.message.includes('Cannot parse privateKey')) {
+      errorMsg = '私钥格式错误，请检查私钥文件';
     }
-    event.reply('ssh-status', { status: 'error', message: `连接失败: ${errorMsg}` });
+    event.reply('ssh-status', { sessionId, status: 'error', message: `连接失败: ${errorMsg}` });
+    sshSessions.delete(sessionId);
   });
 
   conn.on('close', () => {
-    event.reply('ssh-status', { status: 'disconnected', message: '连接已关闭' });
+    event.reply('ssh-status', { sessionId, status: 'disconnected', message: '连接已关闭' });
+    sshSessions.delete(sessionId);
   });
 
   conn.on('keyboard-interactive', (name, instructions, lang, prompts, finish) => {
@@ -210,11 +249,11 @@ ipcMain.on('ssh-connect', (event, config) => {
   });
 
   try {
-    conn.connect({
+    // 构建连接配置
+    const connectConfig = {
       host: config.host,
       port: config.port || 22,
       username: config.username,
-      password: config.password,
       tryKeyboard: true,
       readyTimeout: 30000,
       keepaliveInterval: 10000,
@@ -253,36 +292,58 @@ ipcMain.on('ssh-connect', (event, config) => {
           'hmac-sha1',
         ],
       },
-    });
+    };
+
+    // 根据认证方式添加认证信息
+    if (config.authType === 'privateKey' && config.privateKeyPath) {
+      try {
+        connectConfig.privateKey = fs.readFileSync(config.privateKeyPath);
+        if (config.passphrase) {
+          connectConfig.passphrase = config.passphrase;
+        }
+      } catch (readErr) {
+        event.reply('ssh-status', { sessionId, status: 'error', message: `无法读取私钥文件: ${readErr.message}` });
+        sshSessions.delete(sessionId);
+        return;
+      }
+    } else {
+      connectConfig.password = config.password;
+    }
+
+    conn.connect(connectConfig);
   } catch (err) {
-    event.reply('ssh-status', { status: 'error', message: err.message });
+    event.reply('ssh-status', { sessionId, status: 'error', message: err.message });
+    sshSessions.delete(sessionId);
   }
 });
 
-ipcMain.on('ssh-input', (event, data) => {
-  if (sshStream) {
-    sshStream.write(data);
+ipcMain.on('ssh-input', (event, { sessionId, data }) => {
+  const session = sshSessions.get(sessionId);
+  if (session && session.stream) {
+    session.stream.write(data);
   }
 });
 
-ipcMain.on('ssh-resize', (event, { cols, rows }) => {
-  if (sshStream) {
-    sshStream.setWindow(rows, cols, 0, 0);
+ipcMain.on('ssh-resize', (event, { sessionId, cols, rows }) => {
+  const session = sshSessions.get(sessionId);
+  if (session && session.stream) {
+    session.stream.setWindow(rows, cols, 0, 0);
   }
 });
 
-ipcMain.on('ssh-disconnect', () => {
-  if (sshConnection) {
-    sshConnection.end();
-    sshConnection = null;
-    sshStream = null;
+ipcMain.on('ssh-disconnect', (event, sessionId) => {
+  const session = sshSessions.get(sessionId);
+  if (session && session.conn) {
+    session.conn.end();
+    sshSessions.delete(sessionId);
   }
 });
 
 // SSH执行命令获取系统信息
-ipcMain.handle('ssh-exec', async (event, command) => {
+ipcMain.handle('ssh-exec', async (event, { sessionId, command }) => {
   return new Promise((resolve) => {
-    if (!sshConnection) {
+    const session = sshSessions.get(sessionId);
+    if (!session || !session.conn) {
       resolve({ success: false, output: '' });
       return;
     }
@@ -291,7 +352,7 @@ ipcMain.handle('ssh-exec', async (event, command) => {
       resolve({ success: false, output: '命令执行超时' });
     }, 30000);
 
-    sshConnection.exec(command, (err, stream) => {
+    session.conn.exec(command, (err, stream) => {
       if (err) {
         clearTimeout(timeout);
         resolve({ success: false, output: err.message });
@@ -356,9 +417,13 @@ app.on('window-all-closed', () => {
   if (ptyProcess) {
     ptyProcess.kill();
   }
-  if (sshConnection) {
-    sshConnection.end();
+  // 关闭所有 SSH 连接
+  for (const [sessionId, session] of sshSessions) {
+    if (session.conn) {
+      session.conn.end();
+    }
   }
+  sshSessions.clear();
   if (process.platform !== 'darwin') {
     app.quit();
   }

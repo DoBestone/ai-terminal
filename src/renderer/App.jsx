@@ -1,9 +1,18 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
+import {
+  Monitor, Zap, HardDrive, Globe, BarChart3, Clock,
+  Lock, Plus, Play, Square, Settings, ChevronLeft,
+  ChevronRight, Eye, EyeOff, Edit, Trash2, Check, X,
+  Info, Bot, Laptop, Save
+} from 'lucide-react';
 import './styles/app.css';
 
 const { ipcRenderer } = window.require('electron');
+
+// 生成唯一ID
+const generateId = () => Math.random().toString(36).substr(2, 9);
 
 // 格式化字节
 const formatBytes = (bytes) => {
@@ -41,12 +50,12 @@ const StatusBar = ({ info, type, host }) => {
   return (
     <div className="status-bar">
       <div className="status-item">
-        <span className="status-icon">🖥️</span>
+        <Monitor className="status-icon" size={16} />
         <span className="status-label">主机</span>
         <span className="status-value">{info.hostname || host}</span>
       </div>
       <div className="status-item">
-        <span className="status-icon">⚡</span>
+        <Zap className="status-icon" size={16} />
         <span className="status-label">CPU</span>
         <span className={`status-value ${info.cpuUsage > 80 ? 'warning' : ''}`}>
           {info.cpuUsage?.toFixed(1) || 0}%
@@ -56,7 +65,7 @@ const StatusBar = ({ info, type, host }) => {
         </div>
       </div>
       <div className="status-item">
-        <span className="status-icon">💾</span>
+        <HardDrive className="status-icon" size={16} />
         <span className="status-label">内存</span>
         <span className={`status-value ${info.memPercent > 80 ? 'warning' : ''}`}>
           {formatBytes(info.memUsed)} / {formatBytes(info.memTotal)} ({info.memPercent?.toFixed(0)}%)
@@ -67,7 +76,7 @@ const StatusBar = ({ info, type, host }) => {
       </div>
       {type === 'ssh' && info.netRx !== undefined && (
         <div className="status-item">
-          <span className="status-icon">🌐</span>
+          <Globe className="status-icon" size={16} />
           <span className="status-label">网络</span>
           <span className="status-value">
             ↓{formatBytes(info.netRx)} ↑{formatBytes(info.netTx)}
@@ -76,7 +85,7 @@ const StatusBar = ({ info, type, host }) => {
       )}
       {type === 'local' && info.loadavg && (
         <div className="status-item">
-          <span className="status-icon">📊</span>
+          <BarChart3 className="status-icon" size={16} />
           <span className="status-label">负载</span>
           <span className="status-value">
             {info.loadavg.map(l => l.toFixed(2)).join(' / ')}
@@ -84,7 +93,7 @@ const StatusBar = ({ info, type, host }) => {
         </div>
       )}
       <div className="status-item">
-        <span className="status-icon">⏱️</span>
+        <Clock className="status-icon" size={16} />
         <span className="status-label">运行</span>
         <span className="status-value">
           {type === 'local' ? formatUptime(info.uptime) : info.uptime}
@@ -123,8 +132,57 @@ const AGENT_SYSTEM_PROMPT = `你是一个终端AI助手，可以帮助用户执�
 
 function App() {
   const [activeTab, setActiveTab] = useState('local');
-  const [sshConfig, setSshConfig] = useState({ host: '', port: '22', username: '', password: '' });
-  const [sshStatus, setSshStatus] = useState({ status: 'disconnected', message: '' });
+  const [activeSessionId, setActiveSessionId] = useState(null);
+
+  // SSH 会话管理
+  const [sshSessions, setSshSessions] = useState([]);
+  const sshTerminals = useRef(new Map()); // sessionId -> { term, fitAddon, containerRef }
+
+  // 保存的连接配置 - 作为会话模板
+  const [savedConnections, setSavedConnections] = useState(() => {
+    const saved = localStorage.getItem('ssh_saved_connections');
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  // 右键菜单
+  const [contextMenu, setContextMenu] = useState(null);
+
+  // 侧边栏折叠状态
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    const saved = localStorage.getItem('sidebar_collapsed');
+    return saved ? JSON.parse(saved) : false;
+  });
+
+  // Toast提示
+  const [toast, setToast] = useState(null);
+
+  // 当前编辑的连接配置
+  const [editingConfig, setEditingConfig] = useState({
+    name: '',
+    host: '',
+    port: '22',
+    username: '',
+    authType: 'password',
+    password: '',
+    privateKeyPath: '',
+    passphrase: '',
+    savePassword: false
+  });
+
+  const [showPasswordMap, setShowPasswordMap] = useState({});
+  const [showSaveConnectionModal, setShowSaveConnectionModal] = useState(false);
+  const [showConnectionDrawer, setShowConnectionDrawer] = useState(false);
+  const [drawerConnectionConfig, setDrawerConnectionConfig] = useState({
+    name: '',
+    host: '',
+    port: '22',
+    username: '',
+    authType: 'password',
+    password: '',
+    privateKeyPath: '',
+    passphrase: ''
+  });
+
   const [aiInput, setAiInput] = useState('');
   const [aiMessages, setAiMessages] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -132,20 +190,24 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [terminalError, setTerminalError] = useState('');
   const [localSystemInfo, setLocalSystemInfo] = useState(null);
-  const [sshSystemInfo, setSshSystemInfo] = useState(null);
 
   const terminalRef = useRef(null);
-  const sshTerminalRef = useRef(null);
   const termInstance = useRef(null);
-  const sshTermInstance = useRef(null);
   const fitAddon = useRef(null);
-  const sshFitAddon = useRef(null);
   const messagesEndRef = useRef(null);
+  const sshContainerRef = useRef(null);
 
   // 滚动到最新消息
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
+
+  // 获取连接状态
+  const getConnectionStatus = useCallback((connectionId) => {
+    const session = sshSessions.find(s => s.connectionId === connectionId);
+    if (!session) return 'disconnected';
+    return session.status;
+  }, [sshSessions]);
 
   useEffect(() => {
     scrollToBottom();
@@ -218,73 +280,673 @@ function App() {
         window.removeEventListener('resize', handleResize);
       };
     }
-  }, []); // 移除 activeTab 依赖，只在挂载时运行
+  }, []);
 
-  // 初始化SSH终端 - 组件挂载时就初始化
+  // SSH 数据和状态监听
   useEffect(() => {
-    if (sshTerminalRef.current && !sshTermInstance.current) {
-      const term = new Terminal({
-        theme: {
-          background: '#1a1a2e',
-          foreground: '#eee',
-          cursor: '#f39c12',
+    const handleSshData = (event, { sessionId, data }) => {
+      const termData = sshTerminals.current.get(sessionId);
+      if (termData && termData.term) {
+        termData.term.write(data);
+      }
+    };
+
+    const handleSshStatus = (event, { sessionId, status, message }) => {
+      const termData = sshTerminals.current.get(sessionId);
+
+      setSshSessions(prev => prev.map(session => {
+        if (session.id === sessionId) {
+          if (termData && termData.term) {
+            if (status === 'connected') {
+              termData.term.writeln('\x1b[32m✓ 连接成功\x1b[0m');
+              termData.term.writeln('');
+              // 不清空终端，让服务器的欢迎信息自然显示
+            } else if (status === 'error') {
+              termData.term.writeln('');
+              termData.term.writeln(`\x1b[31m✗ 连接失败: ${message}\x1b[0m`);
+              termData.term.writeln('');
+              termData.term.writeln('\x1b[33mPress Enter to retry...\x1b[0m');
+            } else if (status === 'disconnected') {
+              termData.term.writeln('');
+              termData.term.writeln(`\x1b[33m${message}\x1b[0m`);
+              termData.term.writeln('');
+            }
+          }
+          return { ...session, status, statusMessage: message };
+        }
+        return session;
+      }));
+    };
+
+    ipcRenderer.on('ssh-data', handleSshData);
+    ipcRenderer.on('ssh-status', handleSshStatus);
+
+    return () => {
+      ipcRenderer.removeListener('ssh-data', handleSshData);
+      ipcRenderer.removeListener('ssh-status', handleSshStatus);
+    };
+  }, []);
+
+  // 创建新的 SSH 会话终端
+  const createSshTerminal = useCallback((sessionId, containerElement) => {
+    if (!containerElement || sshTerminals.current.has(sessionId)) return;
+
+    const term = new Terminal({
+      theme: {
+        background: '#1a1a2e',
+        foreground: '#eee',
+        cursor: '#f39c12',
+      },
+      fontSize: 14,
+      fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+      cursorBlink: true,
+      scrollback: 10000,
+    });
+
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(containerElement);
+    setTimeout(() => fit.fit(), 100);
+
+    term.writeln('\x1b[36m═══════════════════════════════════════════════════════════\x1b[0m');
+    term.writeln('\x1b[36m                    SSH 终端已就绪\x1b[0m');
+    term.writeln('\x1b[36m═══════════════════════════════════════════════════════════\x1b[0m');
+    term.writeln('');
+    term.writeln('\x1b[90m请配置连接信息后点击"连接"按钮，或点击侧边栏的\x1b[0m');
+    term.writeln('\x1b[90m连接项右侧的 ▶ 按钮快速连接\x1b[0m');
+    term.writeln('');
+
+    term.onData((data) => {
+      ipcRenderer.send('ssh-input', { sessionId, data });
+    });
+
+    sshTerminals.current.set(sessionId, { term, fitAddon: fit });
+
+    return { term, fitAddon: fit };
+  }, []);
+
+  // 获取或创建会话（基于连接ID）
+  const getOrCreateSession = useCallback((connectionId) => {
+    const connection = savedConnections.find(c => c.id === connectionId);
+    if (!connection) return null;
+
+    let session = sshSessions.find(s => s.connectionId === connectionId);
+    if (!session) {
+      const newSessionId = generateId();
+      session = {
+        id: newSessionId,
+        connectionId: connectionId,
+        name: connection.name,
+        config: {
+          host: connection.host,
+          port: connection.port,
+          username: connection.username,
+          authType: connection.authType,
+          password: connection.password,
+          privateKeyPath: connection.privateKeyPath,
+          passphrase: connection.passphrase || ''
         },
-        fontSize: 14,
-        fontFamily: 'Menlo, Monaco, "Courier New", monospace',
-        cursorBlink: true,
-        scrollback: 10000,
-      });
-
-      const fit = new FitAddon();
-      sshFitAddon.current = fit;
-      term.loadAddon(fit);
-      term.open(sshTerminalRef.current);
-      setTimeout(() => fit.fit(), 100);
-
-      sshTermInstance.current = term;
-
-      term.writeln('SSH终端就绪，请在上方配置连接信息后点击"连接"');
-      term.writeln('');
-
-      // 接收SSH数据
-      ipcRenderer.on('ssh-data', (event, data) => {
-        term.write(data);
-      });
-
-      // 接收SSH状态
-      ipcRenderer.on('ssh-status', (event, status) => {
-        setSshStatus(status);
-        if (status.status === 'connected') {
-          term.clear();
-        } else if (status.status === 'error') {
-          term.writeln(`\r\n\x1b[31m${status.message}\x1b[0m\r\n`);
-        } else if (status.status === 'disconnected') {
-          term.writeln(`\r\n\x1b[33m${status.message}\x1b[0m\r\n`);
-        }
-      });
-
-      // 发送SSH输入
-      term.onData((data) => {
-        ipcRenderer.send('ssh-input', data);
-      });
-
-      const handleResize = () => {
-        if (sshFitAddon.current && sshTermInstance.current) {
-          sshFitAddon.current.fit();
-          ipcRenderer.send('ssh-resize', {
-            cols: sshTermInstance.current.cols,
-            rows: sshTermInstance.current.rows,
-          });
-        }
+        status: 'disconnected',
+        statusMessage: '',
+        systemInfo: null
       };
-
-      window.addEventListener('resize', handleResize);
-
-      return () => {
-        window.removeEventListener('resize', handleResize);
-      };
+      setSshSessions(prev => [...prev, session]);
+      return session;
     }
-  }, []); // 移除 activeTab 依赖，只在挂载时运行
+    return session;
+  }, [savedConnections, sshSessions]);
+
+  // 关闭会话（断开但不删除保存的连接）
+  const closeSession = useCallback((sessionId) => {
+    // 断开连接
+    ipcRenderer.send('ssh-disconnect', sessionId);
+
+    // 清理终端
+    const termData = sshTerminals.current.get(sessionId);
+    if (termData && termData.term) {
+      termData.term.dispose();
+    }
+    sshTerminals.current.delete(sessionId);
+
+    // 移除会话
+    setSshSessions(prev => {
+      const newSessions = prev.filter(s => s.id !== sessionId);
+      if (activeSessionId === sessionId) {
+        if (newSessions.length > 0) {
+          setActiveSessionId(newSessions[0].id);
+        } else {
+          setActiveSessionId(null);
+        }
+      }
+      return newSessions;
+    });
+  }, [activeSessionId]);
+
+  // 删除保存的连接（会同时关闭相关会话）
+  const deleteConnection = useCallback((connectionId) => {
+    // 找到并关闭相关会话
+    const session = sshSessions.find(s => s.connectionId === connectionId);
+    if (session) {
+      closeSession(session.id);
+    }
+
+    // 删除保存的连接
+    const newSavedConnections = savedConnections.filter(c => c.id !== connectionId);
+    setSavedConnections(newSavedConnections);
+    localStorage.setItem('ssh_saved_connections', JSON.stringify(newSavedConnections));
+  }, [savedConnections, sshSessions, closeSession]);
+
+  // 更新会话配置
+  const updateSessionConfig = useCallback((sessionId, updates) => {
+    setSshSessions(prev => prev.map(session =>
+      session.id === sessionId
+        ? { ...session, config: { ...session.config, ...updates } }
+        : session
+    ));
+  }, []);
+
+  // SSH 连接
+  const handleSSHConnect = useCallback((sessionIdOrSession) => {
+    let session;
+    if (typeof sessionIdOrSession === 'string') {
+      session = sshSessions.find(s => s.id === sessionIdOrSession);
+      if (!session) {
+        console.error('Session not found:', sessionIdOrSession);
+        return;
+      }
+    } else {
+      session = sessionIdOrSession;
+    }
+
+    const { config } = session;
+
+    // 验证配置
+    if (!config || !config.host || !config.username) {
+      console.error('Invalid config:', config);
+      setSshSessions(prev => prev.map(s =>
+        s.id === session.id
+          ? { ...s, status: 'error', statusMessage: '配置无效：请填写主机地址和用户名' }
+          : s
+      ));
+      return;
+    }
+
+    // 验证认证信息
+    if (config.authType === 'password' && !config.password) {
+      console.error('Password is required but not provided');
+      setSshSessions(prev => prev.map(s =>
+        s.id === session.id
+          ? { ...s, status: 'error', statusMessage: '密码认证需要提供密码' }
+          : s
+      ));
+      return;
+    }
+
+    if (config.authType === 'privateKey' && !config.privateKeyPath) {
+      console.error('Private key path is required but not provided');
+      setSshSessions(prev => prev.map(s =>
+        s.id === session.id
+          ? { ...s, status: 'error', statusMessage: '私钥认证需要提供私钥文件路径' }
+          : s
+      ));
+      return;
+    }
+
+    console.log('Connecting to SSH with config:', {
+      sessionId: session.id,
+      host: config.host,
+      port: config.port,
+      username: config.username,
+      authType: config.authType
+    });
+
+    // 在终端中显示连接信息
+    const termData = sshTerminals.current.get(session.id);
+    if (termData && termData.term) {
+      termData.term.clear();
+      termData.term.writeln('\x1b[36m正在连接中...\x1b[0m');
+      termData.term.writeln(`\x1b[36m正在连接到 ${config.username}@${config.host}:${config.port}\x1b[0m`);
+      termData.term.writeln(`\x1b[90m认证方式: ${config.authType === 'password' ? '密码认证' : '私钥认证'}\x1b[0m`);
+      termData.term.writeln('');
+    }
+
+    setSshSessions(prev => prev.map(s =>
+      s.id === session.id
+        ? { ...s, status: 'connecting', statusMessage: '正在连接...' }
+        : s
+    ));
+
+    ipcRenderer.send('ssh-connect', {
+      sessionId: session.id,
+      config: {
+        host: config.host,
+        port: parseInt(config.port) || 22,
+        username: config.username,
+        authType: config.authType,
+        password: config.password || '',
+        privateKeyPath: config.privateKeyPath || '',
+        passphrase: config.passphrase || ''
+      }
+    });
+  }, [sshSessions]);
+
+  // SSH 断开
+  const handleSSHDisconnect = useCallback((sessionId) => {
+    ipcRenderer.send('ssh-disconnect', sessionId);
+  }, []);
+
+  // 切换侧边栏折叠状态
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed(prev => {
+      const newState = !prev;
+      localStorage.setItem('sidebar_collapsed', JSON.stringify(newState));
+      return newState;
+    });
+  }, []);
+
+  // 显示Toast提示
+  const showToast = useCallback((message, type = 'success') => {
+    setToast({ message, type });
+    setTimeout(() => {
+      setToast(null);
+    }, 3000);
+  }, []);
+
+  // 保存连接配置
+  const saveConnection = useCallback(() => {
+    const session = sshSessions.find(s => s.id === activeSessionId);
+    if (!session) return;
+
+    const newConnection = {
+      id: generateId(),
+      name: editingConfig.name || `${session.config.host}`,
+      host: session.config.host,
+      port: session.config.port,
+      username: session.config.username,
+      authType: session.config.authType,
+      password: editingConfig.savePassword ? session.config.password : '',
+      privateKeyPath: session.config.privateKeyPath,
+      passphrase: ''
+    };
+
+    const newSavedConnections = [...savedConnections, newConnection];
+    setSavedConnections(newSavedConnections);
+    localStorage.setItem('ssh_saved_connections', JSON.stringify(newSavedConnections));
+    setShowSaveConnectionModal(false);
+    setEditingConfig({ ...editingConfig, name: '', savePassword: false });
+  }, [activeSessionId, sshSessions, savedConnections, editingConfig]);
+
+  // 连接到保存的连接
+  const connectToSavedConnection = useCallback((connectionId) => {
+    const connection = savedConnections.find(c => c.id === connectionId);
+    if (!connection) {
+      console.error('Connection not found:', connectionId);
+      return;
+    }
+
+    let session = sshSessions.find(s => s.connectionId === connectionId);
+
+    if (!session) {
+      // 创建新会话
+      const newSessionId = generateId();
+      const newSession = {
+        id: newSessionId,
+        connectionId: connectionId,
+        name: connection.name,
+        config: {
+          host: connection.host,
+          port: connection.port,
+          username: connection.username,
+          authType: connection.authType,
+          password: connection.password,
+          privateKeyPath: connection.privateKeyPath,
+          passphrase: connection.passphrase || ''
+        },
+        status: 'disconnected',
+        statusMessage: '',
+        systemInfo: null
+      };
+
+      setSshSessions(prev => [...prev, newSession]);
+      setActiveSessionId(newSessionId);
+      setActiveTab('ssh');
+
+      // 延迟确保会话创建完成 - 增加到500ms
+      setTimeout(() => {
+        handleSSHConnect(newSessionId);
+      }, 500);
+    } else {
+      // 如果会话已存在但在连接中，不要重复连接
+      if (session.status === 'connecting') {
+        setActiveSessionId(session.id);
+        setActiveTab('ssh');
+        return;
+      }
+
+      // 如果已连接，先断开再重连
+      if (session.status === 'connected') {
+        ipcRenderer.send('ssh-disconnect', session.id);
+        // 等待断开完成 - 增加到1000ms
+        setTimeout(() => {
+          setActiveSessionId(session.id);
+          setActiveTab('ssh');
+          handleSSHConnect(session.id);
+        }, 1000);
+      } else {
+        setActiveSessionId(session.id);
+        setActiveTab('ssh');
+        // 即使是断开状态也加一点延迟
+        setTimeout(() => {
+          handleSSHConnect(session.id);
+        }, 300);
+      }
+    }
+  }, [savedConnections, sshSessions, handleSSHConnect]);
+
+  // 切换密码显示/隐藏
+  const togglePasswordVisibility = useCallback((fieldId) => {
+    setShowPasswordMap(prev => ({ ...prev, [fieldId]: !prev[fieldId] }));
+  }, []);
+
+  // 右键菜单处理
+  const handleContextMenu = useCallback((e, connectionId) => {
+    e.preventDefault();
+    const connection = savedConnections.find(c => c.id === connectionId);
+    const session = sshSessions.find(s => s.connectionId === connectionId);
+
+    setContextMenu({
+      x: e.clientX,
+      y: e.clientY,
+      connectionId,
+      connection,
+      session
+    });
+  }, [savedConnections, sshSessions]);
+
+  // 关闭右键菜单
+  const closeContextMenu = useCallback(() => {
+    setContextMenu(null);
+  }, []);
+
+  // 编辑连接配置
+  const editConnection = useCallback((connectionId) => {
+    const connection = savedConnections.find(c => c.id === connectionId);
+    if (connection) {
+      setDrawerConnectionConfig({
+        connectionId: connectionId,
+        sessionId: null,
+        name: connection.name,
+        host: connection.host,
+        port: connection.port,
+        username: connection.username,
+        authType: connection.authType,
+        password: connection.password,
+        privateKeyPath: connection.privateKeyPath,
+        passphrase: connection.passphrase || ''
+      });
+      setShowConnectionDrawer(true);
+    }
+    closeContextMenu();
+  }, [savedConnections, closeContextMenu]);
+
+  // 打开连接抽屉 - 为新建会话或编辑现有会话
+  const openConnectionDrawer = useCallback((connectionId = null) => {
+    if (connectionId) {
+      const connection = savedConnections.find(c => c.id === connectionId);
+      if (connection) {
+        setDrawerConnectionConfig({
+          connectionId: connectionId,
+          sessionId: null,
+          name: connection.name,
+          host: connection.host,
+          port: connection.port,
+          username: connection.username,
+          authType: connection.authType,
+          password: connection.password,
+          privateKeyPath: connection.privateKeyPath,
+          passphrase: connection.passphrase || ''
+        });
+      }
+    } else {
+      // 新建连接
+      setDrawerConnectionConfig({
+        connectionId: null,
+        sessionId: null,
+        name: '',
+        host: '',
+        port: '22',
+        username: '',
+        authType: 'password',
+        password: '',
+        privateKeyPath: '',
+        passphrase: ''
+      });
+    }
+    setShowConnectionDrawer(true);
+    setActiveTab('ssh');
+  }, [savedConnections]);
+
+  // 从抽屉直接连接
+  const handleDrawerConnect = useCallback(() => {
+    if (!drawerConnectionConfig.host || !drawerConnectionConfig.username) {
+      alert('请填写主机地址和用户名');
+      return;
+    }
+
+    const { connectionId, sessionId: _, ...config } = drawerConnectionConfig;
+
+    if (connectionId) {
+      // 编辑现有连接
+      const updatedConnection = {
+        id: connectionId,
+        name: config.name || `${config.username}@${config.host}`,
+        host: config.host,
+        port: config.port,
+        username: config.username,
+        authType: config.authType,
+        password: config.password,
+        privateKeyPath: config.privateKeyPath,
+        passphrase: config.passphrase
+      };
+
+      // 先更新保存的连接
+      const newSavedConnections = savedConnections.map(c =>
+        c.id === connectionId ? updatedConnection : c
+      );
+      setSavedConnections(newSavedConnections);
+      localStorage.setItem('ssh_saved_connections', JSON.stringify(newSavedConnections));
+
+      // 查找现有会话
+      let session = sshSessions.find(s => s.connectionId === connectionId);
+
+      if (session) {
+        // 如果已连接，先断开
+        if (session.status === 'connected' || session.status === 'connecting') {
+          ipcRenderer.send('ssh-disconnect', session.id);
+        }
+
+        // 更新会话配置
+        setSshSessions(prev => prev.map(s =>
+          s.connectionId === connectionId
+            ? {
+                ...s,
+                name: updatedConnection.name,
+                config: {
+                  host: config.host,
+                  port: config.port,
+                  username: config.username,
+                  authType: config.authType,
+                  password: config.password,
+                  privateKeyPath: config.privateKeyPath,
+                  passphrase: config.passphrase
+                },
+                status: 'disconnected',
+                statusMessage: ''
+              }
+            : s
+        ));
+
+        setActiveSessionId(session.id);
+        setActiveTab('ssh');
+
+        // 延迟一下确保状态更新完成 - 增加到500ms
+        setTimeout(() => {
+          handleSSHConnect(session.id);
+        }, 500);
+      } else {
+        // 创建新会话
+        const newSessionId = generateId();
+        const newSession = {
+          id: newSessionId,
+          connectionId: connectionId,
+          name: updatedConnection.name,
+          config: {
+            host: config.host,
+            port: config.port,
+            username: config.username,
+            authType: config.authType,
+            password: config.password,
+            privateKeyPath: config.privateKeyPath,
+            passphrase: config.passphrase
+          },
+          status: 'disconnected',
+          statusMessage: '',
+          systemInfo: null
+        };
+
+        setSshSessions(prev => [...prev, newSession]);
+        setActiveSessionId(newSessionId);
+        setActiveTab('ssh');
+
+        setTimeout(() => {
+          handleSSHConnect(newSessionId);
+        }, 200);
+      }
+    } else {
+      // 创建新连接
+      const newConnectionId = generateId();
+      const newConnection = {
+        id: newConnectionId,
+        name: config.name || `${config.username}@${config.host}`,
+        host: config.host,
+        port: config.port,
+        username: config.username,
+        authType: config.authType,
+        password: config.password,
+        privateKeyPath: config.privateKeyPath,
+        passphrase: config.passphrase
+      };
+
+      const newSavedConnections = [...savedConnections, newConnection];
+      setSavedConnections(newSavedConnections);
+      localStorage.setItem('ssh_saved_connections', JSON.stringify(newSavedConnections));
+
+      // 创建新会话
+      const newSessionId = generateId();
+      const newSession = {
+        id: newSessionId,
+        connectionId: newConnectionId,
+        name: newConnection.name,
+        config: {
+          host: config.host,
+          port: config.port,
+          username: config.username,
+          authType: config.authType,
+          password: config.password,
+          privateKeyPath: config.privateKeyPath,
+          passphrase: config.passphrase
+        },
+        status: 'disconnected',
+        statusMessage: '',
+        systemInfo: null
+      };
+
+      setSshSessions(prev => [...prev, newSession]);
+      setActiveSessionId(newSessionId);
+      setActiveTab('ssh');
+
+      setTimeout(() => {
+        handleSSHConnect(newSessionId);
+      }, 200);
+    }
+
+    setShowConnectionDrawer(false);
+  }, [drawerConnectionConfig, savedConnections, sshSessions, handleSSHConnect]);
+
+  // 从抽屉保存连接配置（统一的保存操作）
+  const handleDrawerSave = useCallback(() => {
+    if (!drawerConnectionConfig.host || !drawerConnectionConfig.username) {
+      showToast('请填写主机地址和用户名', 'error');
+      return;
+    }
+
+    const { connectionId, sessionId, ...config } = drawerConnectionConfig;
+
+    if (connectionId) {
+      // 更新现有连接
+      const updatedConnection = {
+        id: connectionId,
+        name: config.name || `${config.username}@${config.host}`,
+        host: config.host,
+        port: config.port,
+        username: config.username,
+        authType: config.authType,
+        password: config.password,
+        privateKeyPath: config.privateKeyPath,
+        passphrase: config.passphrase
+      };
+
+      const newSavedConnections = savedConnections.map(c =>
+        c.id === connectionId ? updatedConnection : c
+      );
+      setSavedConnections(newSavedConnections);
+      localStorage.setItem('ssh_saved_connections', JSON.stringify(newSavedConnections));
+
+      // 更新现有会话配置（如果存在）
+      setSshSessions(prev => prev.map(s =>
+        s.connectionId === connectionId
+          ? { ...s, name: updatedConnection.name, config: { ...config } }
+          : s
+      ));
+
+      showToast('连接配置已更新', 'success');
+    } else {
+      // 新建连接
+      const newConnection = {
+        id: generateId(),
+        name: config.name || `${config.username}@${config.host}`,
+        host: config.host,
+        port: config.port,
+        username: config.username,
+        authType: config.authType,
+        password: config.password,
+        privateKeyPath: config.privateKeyPath,
+        passphrase: config.passphrase
+      };
+
+      const newSavedConnections = [...savedConnections, newConnection];
+      setSavedConnections(newSavedConnections);
+      localStorage.setItem('ssh_saved_connections', JSON.stringify(newSavedConnections));
+
+      showToast('连接配置已保存', 'success');
+    }
+
+    setShowConnectionDrawer(false);
+  }, [drawerConnectionConfig, savedConnections, showToast]);
+
+  // 从抽屉保存并连接
+  const handleDrawerSaveAndConnect = useCallback(() => {
+    handleDrawerSave();
+    handleDrawerConnect();
+  }, [handleDrawerSave, handleDrawerConnect]);
+
+  // 从抽屉选择私钥
+  const handleDrawerSelectPrivateKey = useCallback(async () => {
+    const filePath = await ipcRenderer.invoke('select-private-key');
+    if (filePath) {
+      setDrawerConnectionConfig(prev => ({ ...prev, privateKeyPath: filePath }));
+    }
+  }, []);
 
   // 切换tab时重新调整终端大小
   useEffect(() => {
@@ -295,15 +957,19 @@ function App() {
           cols: termInstance.current.cols,
           rows: termInstance.current.rows,
         });
-      } else if (activeTab === 'ssh' && sshFitAddon.current && sshTermInstance.current) {
-        sshFitAddon.current.fit();
-        ipcRenderer.send('ssh-resize', {
-          cols: sshTermInstance.current.cols,
-          rows: sshTermInstance.current.rows,
-        });
+      } else if (activeTab === 'ssh' && activeSessionId) {
+        const termData = sshTerminals.current.get(activeSessionId);
+        if (termData && termData.fitAddon && termData.term) {
+          termData.fitAddon.fit();
+          ipcRenderer.send('ssh-resize', {
+            sessionId: activeSessionId,
+            cols: termData.term.cols,
+            rows: termData.term.rows,
+          });
+        }
       }
     }, 50);
-  }, [activeTab]);
+  }, [activeTab, activeSessionId]);
 
   // 获取本地系统信息
   useEffect(() => {
@@ -323,70 +989,67 @@ function App() {
 
   // 获取SSH服务器系统信息
   useEffect(() => {
-    let interval;
+    const intervals = new Map();
 
-    const fetchSSHInfo = async () => {
-      if (sshStatus.status !== 'connected') {
-        setSshSystemInfo(null);
-        return;
+    sshSessions.forEach(session => {
+      if (session.status === 'connected' && !intervals.has(session.id)) {
+        const fetchSSHInfo = async () => {
+          try {
+            const [cpuResult, memResult, netResult, uptimeResult, hostnameResult] = await Promise.all([
+              ipcRenderer.invoke('ssh-exec', { sessionId: session.id, command: "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1" }),
+              ipcRenderer.invoke('ssh-exec', { sessionId: session.id, command: "free -b | awk 'NR==2{printf \"%d %d %.1f\", $2, $3, $3*100/$2}'" }),
+              ipcRenderer.invoke('ssh-exec', { sessionId: session.id, command: "cat /proc/net/dev | awk 'NR>2{rx+=$2;tx+=$10}END{print rx,tx}'" }),
+              ipcRenderer.invoke('ssh-exec', { sessionId: session.id, command: "uptime -p 2>/dev/null || uptime | awk -F'up ' '{print $2}' | awk -F',' '{print $1}'" }),
+              ipcRenderer.invoke('ssh-exec', { sessionId: session.id, command: "hostname" }),
+            ]);
+
+            const memParts = memResult.output.split(' ');
+            const netParts = netResult.output.split(' ');
+
+            setSshSessions(prev => prev.map(s =>
+              s.id === session.id
+                ? {
+                    ...s,
+                    systemInfo: {
+                      hostname: hostnameResult.output || session.config.host,
+                      cpuUsage: parseFloat(cpuResult.output) || 0,
+                      memTotal: parseInt(memParts[0]) || 0,
+                      memUsed: parseInt(memParts[1]) || 0,
+                      memPercent: parseFloat(memParts[2]) || 0,
+                      netRx: parseInt(netParts[0]) || 0,
+                      netTx: parseInt(netParts[1]) || 0,
+                      uptime: uptimeResult.output || '-',
+                    }
+                  }
+                : s
+            ));
+          } catch (e) {
+            console.error('获取SSH系统信息失败:', e);
+          }
+        };
+
+        fetchSSHInfo();
+        const interval = setInterval(fetchSSHInfo, 3000);
+        intervals.set(session.id, interval);
       }
-
-      try {
-        // 获取CPU、内存、网络等信息
-        const [cpuResult, memResult, netResult, uptimeResult, hostnameResult] = await Promise.all([
-          ipcRenderer.invoke('ssh-exec', "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1"),
-          ipcRenderer.invoke('ssh-exec', "free -b | awk 'NR==2{printf \"%d %d %.1f\", $2, $3, $3*100/$2}'"),
-          ipcRenderer.invoke('ssh-exec', "cat /proc/net/dev | awk 'NR>2{rx+=$2;tx+=$10}END{print rx,tx}'"),
-          ipcRenderer.invoke('ssh-exec', "uptime -p 2>/dev/null || uptime | awk -F'up ' '{print $2}' | awk -F',' '{print $1}'"),
-          ipcRenderer.invoke('ssh-exec', "hostname"),
-        ]);
-
-        const memParts = memResult.output.split(' ');
-        const netParts = netResult.output.split(' ');
-
-        setSshSystemInfo({
-          hostname: hostnameResult.output || sshConfig.host,
-          cpuUsage: parseFloat(cpuResult.output) || 0,
-          memTotal: parseInt(memParts[0]) || 0,
-          memUsed: parseInt(memParts[1]) || 0,
-          memPercent: parseFloat(memParts[2]) || 0,
-          netRx: parseInt(netParts[0]) || 0,
-          netTx: parseInt(netParts[1]) || 0,
-          uptime: uptimeResult.output || '-',
-        });
-      } catch (e) {
-        console.error('获取SSH系统信息失败:', e);
-      }
-    };
-
-    if (sshStatus.status === 'connected') {
-      fetchSSHInfo();
-      interval = setInterval(fetchSSHInfo, 3000);
-    }
+    });
 
     return () => {
-      if (interval) clearInterval(interval);
+      intervals.forEach(interval => clearInterval(interval));
     };
-  }, [sshStatus.status, sshConfig.host]);
+  }, [sshSessions.map(s => `${s.id}-${s.status}`).join(',')]);
 
-  // SSH连接
-  const handleSSHConnect = () => {
-    if (!sshConfig.host || !sshConfig.username) {
-      setSshStatus({ status: 'error', message: '请填写主机地址和用户名' });
-      return;
+  // 监听点击关闭右键菜单
+  useEffect(() => {
+    if (contextMenu) {
+      document.addEventListener('click', closeContextMenu);
+      return () => {
+        document.removeEventListener('click', closeContextMenu);
+      };
     }
-    setSshStatus({ status: 'connecting', message: '正在连接...' });
-    ipcRenderer.send('ssh-connect', {
-      host: sshConfig.host,
-      port: parseInt(sshConfig.port) || 22,
-      username: sshConfig.username,
-      password: sshConfig.password,
-    });
-  };
+  }, [contextMenu, closeContextMenu]);
 
-  const handleSSHDisconnect = () => {
-    ipcRenderer.send('ssh-disconnect');
-  };
+  // SSH连接 - 已移至上方的 handleSSHConnect
 
   // 执行命令（AI Agent用）
   const executeCommand = useCallback(async (command) => {
@@ -511,37 +1174,136 @@ function App() {
 
   return (
     <div className="app">
-      <div className="sidebar">
+      <div className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
         <div className="logo">
-          <span className="logo-icon">⚡</span>
-          AI Terminal
+          <Zap className="logo-icon" size={20} />
+          {!sidebarCollapsed && 'AI Terminal'}
         </div>
+        <button className="sidebar-toggle" onClick={toggleSidebar} title={sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'}>
+          {sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+        </button>
         <nav className="nav">
           <button
             className={`nav-item ${activeTab === 'local' ? 'active' : ''}`}
             onClick={() => setActiveTab('local')}
+            title="本地终端"
           >
-            <span className="nav-icon">💻</span>
-            本地终端
+            <Laptop className="nav-icon" size={18} />
+            {!sidebarCollapsed && '本地终端'}
           </button>
-          <button
-            className={`nav-item ${activeTab === 'ssh' ? 'active' : ''}`}
-            onClick={() => setActiveTab('ssh')}
-          >
-            <span className="nav-icon">🔐</span>
-            SSH连接
-          </button>
+
+          {/* SSH 会话列表 */}
+          <div className="nav-section">
+            <div className="nav-section-header">
+              <Lock className="nav-icon" size={18} />
+              {!sidebarCollapsed && <span>SSH连接</span>}
+              <button className="add-session-btn" onClick={() => openConnectionDrawer()} title="新建SSH连接">
+                <Plus size={14} />
+              </button>
+            </div>
+            {savedConnections.map(conn => {
+              const status = getConnectionStatus(conn.id);
+              let session = sshSessions.find(s => s.connectionId === conn.id);
+
+              // 如果没有会话，临时创建一个用于显示
+              if (!session) {
+                session = {
+                  id: `temp-${conn.id}`,
+                  connectionId: conn.id,
+                  name: conn.name,
+                  config: {
+                    host: conn.host,
+                    port: conn.port,
+                    username: conn.username,
+                    authType: conn.authType,
+                    password: conn.password,
+                    privateKeyPath: conn.privateKeyPath,
+                    passphrase: conn.passphrase || ''
+                  },
+                  status: 'disconnected',
+                  statusMessage: '',
+                  systemInfo: null
+                };
+              }
+
+              const isActive = activeSessionId === session.id;
+
+              return (
+                <div
+                  key={conn.id}
+                  className={`nav-item ssh-session-item ${isActive ? 'active' : ''}`}
+                  onClick={() => {
+                    // 获取或创建会话
+                    const actualSession = getOrCreateSession(conn.id);
+                    if (actualSession) {
+                      setActiveTab('ssh');
+                      setActiveSessionId(actualSession.id);
+                    }
+                  }}
+                  onContextMenu={(e) => handleContextMenu(e, conn.id)}
+                  title={sidebarCollapsed ? `${conn.name}\n${conn.username}@${conn.host}:${conn.port}` : ''}
+                >
+                  <span className={`session-status-dot ${status}`}></span>
+                  {!sidebarCollapsed && (
+                    <div className="session-info-wrapper">
+                      <span className="session-name">{conn.name}</span>
+                      <span className="session-host">{conn.username}@{conn.host}:{conn.port}</span>
+                    </div>
+                  )}
+                  {!sidebarCollapsed && status === 'disconnected' && (
+                    <button
+                      className="session-action-btn connect"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        connectToSavedConnection(conn.id);
+                      }}
+                      title="连接"
+                    >
+                      <Play size={14} />
+                    </button>
+                  )}
+                  {!sidebarCollapsed && status === 'connected' && (
+                    <button
+                      className="session-action-btn disconnect"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (session) handleSSHDisconnect(session.id);
+                      }}
+                      title="断开连接"
+                    >
+                      <Square size={14} />
+                    </button>
+                  )}
+                  {!sidebarCollapsed && status === 'connecting' && (
+                    <span className="session-status-text">连接中...</span>
+                  )}
+                </div>
+              );
+            })}
+            {savedConnections.length === 0 && (
+              <div className="nav-item-hint" onClick={() => openConnectionDrawer()}>
+                点击 <Plus size={12} style={{display: 'inline', verticalAlign: 'middle'}} /> 添加SSH连接
+              </div>
+            )}
+          </div>
+
           <button
             className={`nav-item ${activeTab === 'ai' ? 'active' : ''}`}
             onClick={() => setActiveTab('ai')}
+            title="AI Agent"
           >
-            <span className="nav-icon">🤖</span>
-            AI Agent
+            <Bot className="nav-icon" size={18} />
+            {!sidebarCollapsed && 'AI Agent'}
           </button>
         </nav>
+
+        {/* 保存的连接 */}
+        {/* 已移到上方SSH连接列表中 */}
+
         <div className="sidebar-footer">
-          <button className="settings-btn" onClick={() => setShowSettings(true)}>
-            ⚙️ 设置
+          <button className="settings-btn" onClick={() => setShowSettings(true)} title="设置">
+            <Settings size={18} />
+            {!sidebarCollapsed && ' 设置'}
           </button>
         </div>
       </div>
@@ -557,64 +1319,77 @@ function App() {
           <StatusBar info={localSystemInfo} type="local" />
         </div>
 
-        {/* SSH终端 - 使用CSS隐藏而非条件渲染 */}
+        {/* SSH终端 - 多会话支持 */}
         <div className="ssh-container" style={{ display: activeTab === 'ssh' ? 'flex' : 'none' }}>
-            <div className="ssh-header">
-              <div className="ssh-form">
-                <input
-                  type="text"
-                  value={sshConfig.host}
-                  onChange={(e) => setSshConfig({ ...sshConfig, host: e.target.value })}
-                  placeholder="主机地址"
-                  className="ssh-input"
-                />
-                <input
-                  type="text"
-                  value={sshConfig.port}
-                  onChange={(e) => setSshConfig({ ...sshConfig, port: e.target.value })}
-                  placeholder="端口"
-                  className="ssh-input small"
-                />
-                <input
-                  type="text"
-                  value={sshConfig.username}
-                  onChange={(e) => setSshConfig({ ...sshConfig, username: e.target.value })}
-                  placeholder="用户名"
-                  className="ssh-input"
-                />
-                <input
-                  type="password"
-                  value={sshConfig.password}
-                  onChange={(e) => setSshConfig({ ...sshConfig, password: e.target.value })}
-                  placeholder="密码"
-                  className="ssh-input"
-                />
-                {sshStatus.status === 'connected' ? (
-                  <button className="ssh-btn disconnect" onClick={handleSSHDisconnect}>
-                    断开
-                  </button>
-                ) : (
-                  <button
-                    className="ssh-btn connect"
-                    onClick={handleSSHConnect}
-                    disabled={sshStatus.status === 'connecting'}
-                  >
-                    {sshStatus.status === 'connecting' ? '连接中...' : '连接'}
-                  </button>
-                )}
-              </div>
-              <div className={`ssh-status ${sshStatus.status}`}>
-                {sshStatus.message || '未连接'}
-              </div>
+          {sshSessions.length > 0 ? (
+            <>
+              {sshSessions.map(session => (
+                <div
+                  key={session.id}
+                  className="ssh-session-view"
+                  style={{ display: activeSessionId === session.id ? 'flex' : 'none' }}
+                >
+                  <div className="ssh-header">
+                    <div className="ssh-header-bar">
+                      <div className="ssh-info">
+                        <span className={`connection-status ${session.status}`}>
+                          {session.status === 'connected' ? '已连接' :
+                           session.status === 'connecting' ? '连接中...' :
+                           session.status === 'error' ? '连接失败' : '未连接'}
+                        </span>
+                        {session.config.host && (
+                          <span className="connection-info">
+                            {session.config.username}@{session.config.host}:{session.config.port}
+                          </span>
+                        )}
+                      </div>
+                      <div className="ssh-actions">
+                        {session.status !== 'connected' && session.status !== 'connecting' && (
+                          <button className="ssh-action-btn primary" onClick={() => editConnection(session.connectionId)}>
+                            <Settings size={14} /> 配置连接
+                          </button>
+                        )}
+                        {session.status === 'connected' && (
+                          <button className="ssh-action-btn danger" onClick={() => handleSSHDisconnect(session.id)}>
+                            断开连接
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    {session.statusMessage && (
+                      <div className={`ssh-status-message ${session.status}`}>
+                        {session.statusMessage}
+                      </div>
+                    )}
+                  </div>
+                  <div
+                    ref={(el) => {
+                      if (el && !sshTerminals.current.has(session.id)) {
+                        createSshTerminal(session.id, el);
+                      }
+                    }}
+                    className="terminal"
+                  />
+                  <StatusBar info={session.systemInfo} type="ssh" host={session.config.host} />
+                </div>
+              ))}
+            </>
+          ) : (
+            <div className="ssh-empty-state">
+              <Lock size={48} className="empty-icon" />
+              <h3>没有活动的SSH会话</h3>
+              <p>点击侧边栏的 <Plus size={12} style={{display: 'inline', verticalAlign: 'middle'}} /> 按钮添加新的SSH连接</p>
+              <button className="add-session-btn-large" onClick={() => openConnectionDrawer()}>
+                <Plus size={16} /> 新建SSH会话
+              </button>
             </div>
-            <div ref={sshTerminalRef} className="terminal" />
-            <StatusBar info={sshSystemInfo} type="ssh" host={sshConfig.host} />
+          )}
         </div>
 
         {/* AI Agent - 使用CSS隐藏而非条件渲染 */}
         <div className="ai-panel" style={{ display: activeTab === 'ai' ? 'flex' : 'none' }}>
             <div className="ai-header">
-              <h2>🤖 AI Agent</h2>
+              <h2><Bot size={20} style={{display: 'inline', verticalAlign: 'middle'}} /> AI Agent</h2>
               <p>让AI帮你执行终端命令，支持自然语言交互</p>
             </div>
 
@@ -652,7 +1427,7 @@ function App() {
                   {msg.role === 'result' && (
                     <div className={`message-content result-message ${msg.success ? 'success' : 'error'}`}>
                       <div className="result-header">
-                        <span className="result-icon">{msg.success ? '✅' : '❌'}</span>
+                        {msg.success ? <Check className="result-icon" size={16} /> : <X className="result-icon" size={16} />}
                         <code>{msg.command}</code>
                       </div>
                       <pre className="result-output">{msg.output}</pre>
@@ -714,6 +1489,245 @@ function App() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* 保存连接弹窗 */}
+      {showSaveConnectionModal && (
+        <div className="modal-overlay" onClick={() => setShowSaveConnectionModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2>保存连接</h2>
+            <div className="form-group">
+              <label>连接名称</label>
+              <input
+                type="text"
+                value={editingConfig.name}
+                onChange={(e) => setEditingConfig({ ...editingConfig, name: e.target.value })}
+                placeholder="例如: 生产服务器"
+              />
+            </div>
+            <div className="form-group checkbox-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={editingConfig.savePassword}
+                  onChange={(e) => setEditingConfig({ ...editingConfig, savePassword: e.target.checked })}
+                />
+                保存密码
+              </label>
+              <small>注意：密码将以明文形式保存在本地</small>
+            </div>
+            <div className="modal-actions">
+              <button className="btn-cancel" onClick={() => setShowSaveConnectionModal(false)}>
+                取消
+              </button>
+              <button className="btn-save" onClick={saveConnection}>
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SSH连接配置抽屉 */}
+      {showConnectionDrawer && (
+        <>
+          <div className="drawer-overlay" onClick={() => setShowConnectionDrawer(false)} />
+          <div className="drawer">
+            <div className="drawer-header">
+              <h2>{drawerConnectionConfig.connectionId ? '编辑SSH连接' : '新建SSH连接'}</h2>
+              <button className="drawer-close" onClick={() => setShowConnectionDrawer(false)}>
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="drawer-content">
+              <div className="drawer-notice">
+                <Lock size={16} style={{display: 'inline', verticalAlign: 'middle'}} /> 所有认证信息仅保存在本地，不会上传到任何服务器
+              </div>
+
+              <div className="form-group">
+                <label>连接名称（可选）</label>
+                <input
+                  type="text"
+                  value={drawerConnectionConfig.name}
+                  onChange={(e) => setDrawerConnectionConfig({ ...drawerConnectionConfig, name: e.target.value })}
+                  placeholder="例如: 生产服务器"
+                  className="drawer-input"
+                />
+              </div>
+
+              <div className="form-group">
+                <label>主机地址 *</label>
+                <input
+                  type="text"
+                  value={drawerConnectionConfig.host}
+                  onChange={(e) => setDrawerConnectionConfig({ ...drawerConnectionConfig, host: e.target.value })}
+                  placeholder="例如: 192.168.1.100"
+                  className="drawer-input"
+                />
+              </div>
+
+              <div className="form-group-row">
+                <div className="form-group" style={{ flex: 1 }}>
+                  <label>端口</label>
+                  <input
+                    type="text"
+                    value={drawerConnectionConfig.port}
+                    onChange={(e) => setDrawerConnectionConfig({ ...drawerConnectionConfig, port: e.target.value })}
+                    placeholder="22"
+                    className="drawer-input"
+                  />
+                </div>
+                <div className="form-group" style={{ flex: 2 }}>
+                  <label>用户名 *</label>
+                  <input
+                    type="text"
+                    value={drawerConnectionConfig.username}
+                    onChange={(e) => setDrawerConnectionConfig({ ...drawerConnectionConfig, username: e.target.value })}
+                    placeholder="例如: root"
+                    className="drawer-input"
+                  />
+                </div>
+              </div>
+
+              <div className="form-group">
+                <label>认证方式</label>
+                <select
+                  value={drawerConnectionConfig.authType}
+                  onChange={(e) => setDrawerConnectionConfig({ ...drawerConnectionConfig, authType: e.target.value })}
+                  className="drawer-input"
+                >
+                  <option value="password">密码认证</option>
+                  <option value="privateKey">私钥认证</option>
+                </select>
+              </div>
+
+              {drawerConnectionConfig.authType === 'password' ? (
+                <div className="form-group">
+                  <label>密码 *</label>
+                  <div className="password-input-wrapper">
+                    <input
+                      type={showPasswordMap['drawer-pwd'] ? 'text' : 'password'}
+                      value={drawerConnectionConfig.password}
+                      onChange={(e) => setDrawerConnectionConfig({ ...drawerConnectionConfig, password: e.target.value })}
+                      placeholder="输入密码"
+                      className="drawer-input"
+                    />
+                    <button
+                      type="button"
+                      className="toggle-password-btn"
+                      onClick={() => togglePasswordVisibility('drawer-pwd')}
+                      title={showPasswordMap['drawer-pwd'] ? '隐藏密码' : '显示密码'}
+                    >
+                      {showPasswordMap['drawer-pwd'] ? <Eye size={16} /> : <EyeOff size={16} />}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="form-group">
+                    <label>私钥文件 *</label>
+                    <div className="file-input-group">
+                      <input
+                        type="text"
+                        value={drawerConnectionConfig.privateKeyPath}
+                        placeholder="选择私钥文件"
+                        className="drawer-input"
+                        readOnly
+                      />
+                      <button
+                        type="button"
+                        className="file-select-btn"
+                        onClick={handleDrawerSelectPrivateKey}
+                      >
+                        选择文件
+                      </button>
+                    </div>
+                  </div>
+                  <div className="form-group">
+                    <label>私钥密码（可选）</label>
+                    <div className="password-input-wrapper">
+                      <input
+                        type={showPasswordMap['drawer-passphrase'] ? 'text' : 'password'}
+                        value={drawerConnectionConfig.passphrase}
+                        onChange={(e) => setDrawerConnectionConfig({ ...drawerConnectionConfig, passphrase: e.target.value })}
+                        placeholder="如果私钥有密码，请输入"
+                        className="drawer-input"
+                      />
+                      <button
+                        type="button"
+                        className="toggle-password-btn"
+                        onClick={() => togglePasswordVisibility('drawer-passphrase')}
+                      >
+                        {showPasswordMap['drawer-passphrase'] ? <Eye size={16} /> : <EyeOff size={16} />}
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="drawer-footer">
+              <button className="drawer-btn primary full-width" onClick={handleDrawerSave}>
+                <Save size={16} /> 保存配置
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* 右键菜单 */}
+      {contextMenu && (
+        <div
+          className="context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {contextMenu.session && contextMenu.session.status === 'disconnected' && (
+            <div className="context-menu-item" onClick={() => {
+              connectToSavedConnection(contextMenu.connectionId);
+              closeContextMenu();
+            }}>
+              <Play className="context-menu-icon" size={14} />
+              连接
+            </div>
+          )}
+          {contextMenu.session && contextMenu.session.status === 'connected' && (
+            <div className="context-menu-item" onClick={() => {
+              handleSSHDisconnect(contextMenu.session.id);
+              closeContextMenu();
+            }}>
+              <Square className="context-menu-icon" size={14} />
+              断开连接
+            </div>
+          )}
+          <div className="context-menu-item" onClick={() => {
+            editConnection(contextMenu.connectionId);
+          }}>
+            <Edit className="context-menu-icon" size={14} />
+            编辑配置
+          </div>
+          <div className="context-menu-divider"></div>
+          <div className="context-menu-item danger" onClick={() => {
+            if (confirm(`确定要删除连接 "${contextMenu.connection.name}" 吗？`)) {
+              deleteConnection(contextMenu.connectionId);
+              closeContextMenu();
+            }
+          }}>
+            <Trash2 className="context-menu-icon" size={14} />
+            删除连接
+          </div>
+        </div>
+      )}
+
+      {/* Toast提示 */}
+      {toast && (
+        <div className={`toast ${toast.type}`}>
+          {toast.type === 'success' ? <Check className="toast-icon" size={16} /> :
+           toast.type === 'error' ? <X className="toast-icon" size={16} /> :
+           <Info className="toast-icon" size={16} />}
+          <span className="toast-message">{toast.message}</span>
         </div>
       )}
     </div>
